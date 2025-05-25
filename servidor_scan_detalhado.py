@@ -12,7 +12,21 @@ import re # "Regular Expressions" - uma mini-linguagem para encontrar padrões e
 from concurrent.futures import ThreadPoolExecutor, as_completed # Ferramentas para executar tarefas em paralelo, tornando o scan mais rápido.
 import platform # Para descobrir informações sobre o sistema operacional onde o script está rodando (ex: Linux, Windows).
 from scapy.all import ARP, Ether, srp # Scapy é uma poderosa caixa de ferramentas para criar e manipular pacotes de rede. Usamos para o ARP scan.
-from pysnmp.hlapi import getCmd, SnmpEngine, CommunityData, UdpTransportTarget, ContextData, ObjectType, ObjectIdentity # Kit de ferramentas para SNMP!
+
+# Usando o CommandGenerator (cmdgen) do PySNMP, que funcionou no seu ambiente.
+try:
+    from pysnmp.entity.rfc3413.oneliner import cmdgen
+    CMDGEN_DISPONIVEL = True
+    print("[INFO PySNMP] Módulo 'cmdgen' importado com sucesso.")
+except ModuleNotFoundError:
+    print("[ERRO FATAL PySNMP] Não foi possível importar 'cmdgen' de 'pysnmp.entity.rfc3413.oneliner'.")
+    print("Este módulo é necessário para a funcionalidade SNMP. Verifique a instalação do PySNMP.")
+    print("A funcionalidade SNMP não estará disponível.")
+    CMDGEN_DISPONIVEL = False
+except ImportError as e_cmdgen_import:
+    print(f"[ERRO FATAL PySNMP] Erro ao importar 'cmdgen': {e_cmdgen_import}")
+    print("A funcionalidade SNMP não estará disponível.")
+    CMDGEN_DISPONIVEL = False
 
 # --------------------------------------------------------------------------------
 # SEÇÃO 2: CONFIGURAÇÕES GLOBAIS DO NOSSO SERVIDOR
@@ -20,16 +34,16 @@ from pysnmp.hlapi import getCmd, SnmpEngine, CommunityData, UdpTransportTarget, 
 # Aqui definimos algumas "constantes" - valores que não vão mudar enquanto o programa roda.
 # Escrever em MAIÚSCULAS é uma convenção em Python para indicar que são constantes.
 
-PORTA_SERVIDOR = 35640      # Número da "porta" de comunicação que nosso servidor vai usar. Pense numa sala numerada num prédio.
+PORTA_SERVIDOR = 35640      # Número da "porta" de comunicação que nosso servidor vai usar.
 MAX_THREADS_SCAN_PING = 50  # Quantos "trabalhadores" (threads) no máximo vão fazer pings ao mesmo tempo.
 TIMEOUT_PING_SEGUNDOS = 0.5 # Tempo máximo (em segundos) que vamos esperar por uma resposta de um ping.
 USAR_ARP_SCAN = True        # Se True, vamos tentar o ARP scan (rápido em redes locais). Se False, só ping.
 
 # Configurações específicas para o SNMP
-SNMP_COMMUNITY_STRING = 'public' # "Senha" comum para acessar dados SNMP (somente leitura). Muitos dispositivos vêm com 'public' por padrão.
+SNMP_COMMUNITY_STRING = 'public' # "Senha" comum para acesso SNMP (somente leitura).
 SNMP_PORTA = 161                 # Porta padrão para requisições SNMP.
-SNMP_TIMEOUT_SEGUNDOS = 0.5      # Tempo máximo de espera por uma resposta SNMP.
-SNMP_RETENTATIVAS = 0            # Quantas vezes tentar de novo se uma requisição SNMP falhar (0 = não tentar de novo).
+SNMP_TIMEOUT_SEGUNDOS = 1.0      # Tempo máximo de espera por uma resposta SNMP (aumentado para 1s).
+SNMP_RETENTATIVAS = 0            # Quantas vezes tentar de novo se uma requisição SNMP falhar.
 
 # --------------------------------------------------------------------------------
 # SEÇÃO 3: FUNÇÕES AUXILIARES E DE SCAN
@@ -41,7 +55,7 @@ SNMP_RETENTATIVAS = 0            # Quantas vezes tentar de novo se uma requisiç
 def obter_sysname_via_snmp(ip_alvo):
     """
     Esta função tenta buscar o "sysName" (nome do sistema) de um dispositivo
-    na rede usando o protocolo SNMP.
+    na rede usando o protocolo SNMP com CommandGenerator do pysnmp.
 
     Argumentos:
         ip_alvo (str): O endereço IP do dispositivo que queremos consultar.
@@ -50,76 +64,75 @@ def obter_sysname_via_snmp(ip_alvo):
         str: O sysName do dispositivo, se encontrado.
         None: Se não conseguir encontrar o sysName ou se ocorrer um erro.
     """
-    # print(f"  [SNMP Tentativa] Verificando sysName para {ip_alvo}...") # Linha para depuração
+    # Verifica primeiro se a ferramenta cmdgen do PySNMP está disponível.
+    # Se não foi importada com sucesso lá no começo, não adianta nem tentar.
+    if not CMDGEN_DISPONIVEL:
+        # print(f"  [SNMP DEBUG] cmdgen não está disponível. Pulando SNMP para {ip_alvo}.")
+        return None # Retorna "nada" (None) indicando que o SNMP não pode ser usado.
 
-    # 1. Cria uma "engine" SNMP. É o motor que vai processar nossa requisição.
-    snmp_engine_local = SnmpEngine()
+    # print(f"  [SNMP cmdgen Tentativa DEBUG] Verificando sysName para {ip_alvo}...") # Linha para depuração
 
-    # 2. Define a "comunidade" SNMP. Pense nisso como um grupo de acesso.
-    #    'mpModel=0' significa que estamos usando SNMPv1 (uma versão mais antiga e simples).
-    dados_comunidade = CommunityData(SNMP_COMMUNITY_STRING, mpModel=0)
+    # 1. Cria uma instância (um "objeto") do CommandGenerator.
+    #    Pense nisso como pegar a "máquina de fazer pedidos SNMP" da caixa de ferramentas cmdgen.
+    gerador_comandos_snmp = cmdgen.CommandGenerator()
 
-    # 3. Define o "alvo" da nossa requisição: o IP e a porta do dispositivo.
-    #    Também configuramos o timeout e as retentativas aqui.
-    alvo_transporte_udp = UdpTransportTarget(
-        (str(ip_alvo), SNMP_PORTA),
-        timeout=SNMP_TIMEOUT_SEGUNDOS,
-        retries=SNMP_RETENTATIVAS
+    # 2. Executa o comando GET do SNMP para buscar o sysName.
+    #    A função 'getCmd' desta máquina 'gerador_comandos_snmp' precisa de alguns "ingredientes":
+    #    a) Informações da comunidade SNMP:
+    #       - 'cmdgen.CommunityData(SNMP_COMMUNITY_STRING, mpModel=0)'
+    #         Cria um objeto que guarda a "palavra-chave" (community string, ex: 'public')
+    #         e a versão do SNMP a ser usada (mpModel=0 significa SNMPv1, a mais simples).
+    #    b) Informações do Alvo (para onde enviar o pedido):
+    #       - 'cmdgen.UdpTransportTarget((str(ip_alvo), SNMP_PORTA), timeout=SNMP_TIMEOUT_SEGUNDOS, retries=SNMP_RETENTATIVAS)'
+    #         Define o IP do dispositivo alvo (convertido para texto com str()), a porta SNMP (161),
+    #         quanto tempo esperar pela resposta (timeout) e quantas vezes tentar de novo (retries).
+    #    c) O OID (Object Identifier) da informação que queremos:
+    #       - '1.3.6.1.2.1.1.5.0' é o "endereço universal" dentro do "catálogo" SNMP
+    #         que corresponde ao 'sysName' (nome do sistema) do dispositivo.
+    #
+    #    A função 'getCmd' retorna 4 coisas diretamente (não um iterador como no hlapi):
+    #    - indicacao_erro: Informa se houve algum problema na "viagem" do pedido SNMP (ex: tempo esgotou, IP não alcançável).
+    #    - status_erro: Se o dispositivo respondeu, mas com uma mensagem de erro SNMP (ex: "essa informação não existe aqui").
+    #    - indice_erro: Se 'status_erro' aconteceu, ajuda a identificar qual item do pedido falhou (mais útil se pedíssemos várias coisas).
+    #    - variaveis_recebidas: Se tudo deu certo, aqui vem a informação que pedimos (uma lista de pares: OID e o Valor).
+    indicacao_erro, status_erro, indice_erro, variaveis_recebidas = gerador_comandos_snmp.getCmd(
+        cmdgen.CommunityData(SNMP_COMMUNITY_STRING, mpModel=0),
+        cmdgen.UdpTransportTarget(
+            (str(ip_alvo), SNMP_PORTA),
+            timeout=SNMP_TIMEOUT_SEGUNDOS,
+            retries=SNMP_RETENTATIVAS
+        ),
+        '1.3.6.1.2.1.1.5.0' # OID para sysName
     )
 
-    # 4. Define o "contexto" SNMP. Para operações simples, geralmente não precisamos nos preocupar com isso.
-    dados_contexto = ContextData()
-
-    # 5. Define o "OID" (Object Identifier) que queremos buscar.
-    #    O OID '1.3.6.1.2.1.1.5.0' corresponde ao sysName no padrão SNMP (MIB-II).
-    #    'SNMPv2-MIB', 'sysName', 0 é uma forma mais amigável de escrever esse OID usando o pysnmp.
-    oid_sysname = ObjectType(ObjectIdentity('SNMPv2-MIB', 'sysName', 0))
-
-    # 6. Executa o comando GET do SNMP.
-    #    'next(...)' é usado porque getCmd retorna um "gerador" (um tipo especial de iterador).
-    #    Estamos pedindo para pegar o próximo (e neste caso, único) resultado.
-    iterador_resultado = getCmd(
-        snmp_engine_local,
-        dados_comunidade,
-        alvo_transporte_udp,
-        dados_contexto,
-        oid_sysname
-    )
-
-    try:
-        # Tentamos pegar o resultado da nossa consulta SNMP
-        indicacao_erro, status_erro, indice_erro, variaveis_recebidas = next(iterador_resultado)
-
-        # 7. Verifica se houve algum erro na comunicação SNMP.
-        if indicacao_erro:
-            # print(f"  [SNMP Falha] Indicação de erro para {ip_alvo}: {indicacao_erro}")
-            return None # Se houve erro na "indicação" (ex: timeout), retorna nada.
-        elif status_erro:
-            # Se o dispositivo respondeu, mas com um status de erro SNMP (ex: OID não existe lá).
-            # print(f"  [SNMP Falha] Status de erro para {ip_alvo}: {status_erro.prettyPrint()} em {indice_erro and variaveis_recebidas[int(indice_erro) - 1][0] or '?'}")
-            return None
+    # 3. Verifica se houve algum erro.
+    if indicacao_erro:
+        # Se 'indicacao_erro' contiver alguma mensagem, significa que um problema de comunicação ocorreu.
+        # print(f"  [SNMP cmdgen Falha DEBUG] Indicação de erro para {ip_alvo}: {indicacao_erro}")
+        return None # Retorna "nada" para indicar falha.
+    elif status_erro:
+        # Se o dispositivo respondeu, mas indicando um erro SNMP.
+        # O '.prettyPrint()' ajuda a mostrar o erro de forma mais legível.
+        # A parte com 'indice_erro' e 'variaveis_recebidas' tenta dar mais detalhes sobre qual OID falhou.
+        # print(f"  [SNMP cmdgen Falha DEBUG] Status de erro para {ip_alvo}: {status_erro.prettyPrint()} em {indice_erro and variaveis_recebidas[int(indice_erro) - 1][0] or '?'}")
+        return None # Retorna "nada".
+    else:
+        # Se não houve 'indicacao_erro' nem 'status_erro', o pedido SNMP provavelmente foi bem-sucedido!
+        # Agora, verificamos se recebemos de volta as variáveis (o sysName).
+        # 'variaveis_recebidas' é uma lista. 'len(variaveis_recebidas)' nos diz quantos itens tem na lista.
+        if variaveis_recebidas and len(variaveis_recebidas) > 0:
+            # Se a lista não está vazia e tem pelo menos um item:
+            # O sysName que queremos é o "Valor" do primeiro par (OID, Valor) na lista.
+            # 'variaveis_recebidas[0]' pega o primeiro par (que é uma tupla).
+            # 'variaveis_recebidas[0][1]' pega o segundo item desse par, que é o Valor do sysName.
+            objeto_sysname = variaveis_recebidas[0][1]
+            # O valor pode vir num formato especial do SNMP (OctetString).
+            # O método '.prettyPrint()' converte esse valor para um texto (string) normal.
+            return objeto_sysname.prettyPrint() # Sucesso! Retorna o nome do sistema.
         else:
-            # 8. Se tudo deu certo, 'variaveis_recebidas' contém a resposta.
-            #    Ela é uma lista de tuplas, onde cada tupla é (OID_recebido, valor_recebido).
-            #    Para um GET simples em sysName.0, esperamos uma tupla na lista.
-            if variaveis_recebidas and len(variaveis_recebidas) > 0:
-                # O valor do sysName é o segundo item da primeira tupla.
-                objeto_sysname = variaveis_recebidas[0][1]
-                # O método '.prettyPrint()' converte o valor para um formato de texto legível.
-                return objeto_sysname.prettyPrint()
-            else:
-                # print(f"  [SNMP Falha] Nenhuma variável (sysName) retornada para {ip_alvo}.")
-                return None # Não recebemos o valor esperado.
-
-    except StopIteration:
-        # Isso acontece se o 'next(iterador_resultado)' não encontrar nenhum item,
-        # o que geralmente significa que não houve resposta SNMP (timeout, host não responde SNMP).
-        # print(f"  [SNMP Falha] Sem resposta SNMP (StopIteration/Timeout) de {ip_alvo}.")
-        return None
-    except Exception as e:
-        # Captura qualquer outro erro inesperado durante o processo SNMP.
-        # print(f"  [SNMP Falha] Exceção inesperada para {ip_alvo}: {e}")
-        return None
+            # Se não veio erro, mas também não veio nenhuma variável. Estranho, mas pode acontecer.
+            # print(f"  [SNMP cmdgen Falha DEBUG] Nenhuma variável (sysName) retornada para {ip_alvo}, embora não tenha havido erro.")
+            return None # Retorna "nada".
 
 def testar_host_com_ping(ip_host_para_testar):
     """
@@ -132,44 +145,28 @@ def testar_host_com_ping(ip_host_para_testar):
     Retorna:
         bool: True se o host responder ao ping, False caso contrário.
     """
-    # Converte o IP para formato de texto (string), caso ainda não seja.
-    ip_texto = str(ip_host_para_testar)
-
-    # Monta o comando 'ping' que será executado.
-    # As opções são específicas para Linux, como pedido pelo professor:
-    # '-c 1': Enviar apenas 1 pacote de ping.
-    # '-W TIMEOUT_PING_SEGUNDOS': Esperar no máximo X segundos pela resposta.
-    # '-i 0.2': Intervalo de 0.2 segundos (ajuda a não sobrecarregar e ser rápido).
+    ip_texto = str(ip_host_para_testar) # Garante que o IP seja uma string.
+    # Monta o comando 'ping' para Linux.
     comando = ['ping', '-c', '1', '-W', str(TIMEOUT_PING_SEGUNDOS), '-i', '0.2', ip_texto]
-
-    # O bloco 'try...except' é usado para tratamento de erros.
-    # Se algo der errado dentro do 'try', o Python pula para o 'except' correspondente.
     try:
-        # 'subprocess.run()' executa o comando.
-        # 'stdout=subprocess.DEVNULL' e 'stderr=subprocess.DEVNULL' escondem a saída normal
-        # do comando ping, pois só nos interessa se ele funcionou ou não.
-        # 'timeout' no subprocess.run previne que ele fique travado indefinidamente.
+        # Executa o comando 'ping' e não mostra sua saída na tela.
         resultado_comando = subprocess.run(
             comando,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=TIMEOUT_PING_SEGUNDOS + 0.5 # Um pouco mais que o timeout do ping em si.
+            stdout=subprocess.DEVNULL, # Esconde a saída padrão do comando.
+            stderr=subprocess.DEVNULL, # Esconde as mensagens de erro do comando.
+            timeout=TIMEOUT_PING_SEGUNDOS + 0.5 # Timeout para o subprocesso, um pouco maior que o do ping.
         )
-        # 'resultado_comando.returncode' é 0 se o ping foi bem-sucedido.
+        # Se o comando 'ping' retornou código 0, significa sucesso.
         return resultado_comando.returncode == 0
-    except subprocess.TimeoutExpired:
-        # Se o comando 'ping' demorar mais que o 'timeout' do subprocess.run.
-        # print(f"  [Ping DEBUG] Timeout ao executar ping para {ip_texto}.")
+    except subprocess.TimeoutExpired: # Se o subprocesso demorou demais.
         return False
-    except Exception:
-        # Se qualquer outro erro ocorrer ao tentar executar o ping.
-        # print(f"  [Ping DEBUG] Erro ao executar ping para {ip_texto}: {e_ping}")
+    except Exception: # Para qualquer outro erro ao tentar rodar o ping.
         return False
 
 def scan_arp_rede_local(objeto_rede_alvo):
     """
     Realiza um scan usando o protocolo ARP para descobrir hosts na rede local.
-    ARP é mais rápido que ping para redes locais. Usa a biblioteca Scapy.
+    Usa a biblioteca Scapy.
 
     Argumentos:
         objeto_rede_alvo (ipaddress.IPv4Network): O objeto representando a rede a ser escaneada.
@@ -178,39 +175,21 @@ def scan_arp_rede_local(objeto_rede_alvo):
         list: Uma lista de strings, cada uma sendo um IP ativo encontrado via ARP.
     """
     ips_ativos_via_arp = [] # Lista para guardar os IPs que responderem.
-    # print(f"  [ARP DEBUG] Iniciando scan ARP para a rede {objeto_rede_alvo}...")
-
-    # Bloco try...except para lidar com possíveis erros durante o uso do Scapy.
     try:
-        # 1. Monta o pacote ARP Request.
-        #    'Ether(dst="ff:ff:ff:ff:ff:ff")' cria o cabeçalho Ethernet com destino broadcast
-        #    (para todos na rede local).
-        #    'ARP(pdst=str(objeto_rede_alvo))' cria a parte ARP da requisição, perguntando
-        #    pelos IPs dentro da 'objeto_rede_alvo'. Scapy vai gerar um request para cada IP.
+        # Monta o pacote ARP: Ethernet de broadcast / ARP Request para a rede alvo.
         pacote_arp_requisicao = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=str(objeto_rede_alvo))
-
-        # 2. Envia os pacotes e recebe as respostas.
-        #    'srp' é a função do Scapy para enviar e receber pacotes na camada 2 (Ethernet).
-        #    'timeout=1' espera por 1 segundo no máximo.
-        #    'verbose=False' para não imprimir muita informação do Scapy na tela.
-        #    Retorna duas listas: 'respondidos' (pacotes que tiveram resposta) e 'nao_respondidos'.
+        # Envia os pacotes e recebe as respostas (srp = Send and Receive packets at layer 2).
+        # timeout=1 segundo, verbose=False para não imprimir mensagens do Scapy.
         lista_pacotes_respondidos, _ = srp(pacote_arp_requisicao, timeout=1, verbose=False)
 
-        # 3. Processa as respostas.
-        if lista_pacotes_respondidos:
-            # print(f"  [ARP DEBUG] {len(lista_pacotes_respondidos)} respostas ARP recebidas.")
-            # 'lista_pacotes_respondidos' contém tuplas (pacote_enviado, pacote_recebido).
-            # Nós queremos o IP de origem ('psrc') do pacote recebido.
+        if lista_pacotes_respondidos: # Se houve respostas...
+            # Para cada par (pacote enviado, pacote recebido) na lista de respondidos...
             for _, pacote_resposta_arp in lista_pacotes_respondidos:
+                # Adiciona o IP de origem da resposta ARP ('psrc') à nossa lista.
                 ips_ativos_via_arp.append(pacote_resposta_arp.psrc)
-        # else:
-            # print(f"  [ARP DEBUG] Nenhuma resposta ARP.")
-
-    except Exception as e_arp:
+    except Exception as e_arp: # Se ocorrer algum erro com o Scapy.
         print(f"  [ARP ERRO] Falha durante o scan ARP: {e_arp}")
-
-    # 'set(ips_ativos_via_arp)' remove duplicatas, e 'list(...)' converte de volta para lista.
-    return list(set(ips_ativos_via_arp))
+    return list(set(ips_ativos_via_arp)) # Retorna a lista sem IPs duplicados.
 
 def scan_ping_em_paralelo(objeto_rede_alvo):
     """
@@ -223,48 +202,32 @@ def scan_ping_em_paralelo(objeto_rede_alvo):
     Retorna:
         list: Uma lista de strings, cada uma sendo um IP ativo encontrado via Ping.
     """
-    ips_ativos_via_ping = [] # Lista para os IPs que responderem ao ping.
-
-    # '.hosts()' retorna um gerador com todos os IPs utilizáveis dentro da rede
-    # (excluindo o endereço da rede e o de broadcast).
+    ips_ativos_via_ping = [] # Lista para os IPs que responderem.
+    # Pega todos os IPs "utilizáveis" da rede (ex: .1 a .254 para um /24).
     lista_ips_para_testar = list(objeto_rede_alvo.hosts())
 
-    if not lista_ips_para_testar:
-        # print(f"  [Ping Scan DEBUG] A rede {objeto_rede_alvo} não possui hosts para testar.")
-        return [] # Se não há IPs, retorna lista vazia.
+    if not lista_ips_para_testar: # Se não há IPs para testar...
+        return [] # Retorna lista vazia.
 
-    # print(f"  [Ping Scan DEBUG] Iniciando pings para {len(lista_ips_para_testar)} IPs...")
-
-    # 'ThreadPoolExecutor' gerencia um grupo de "trabalhadores" (threads).
-    # 'max_workers' define quantos pings podem rodar simultaneamente.
-    with ThreadPoolExecutor(max_workers=MAX_THREADS_SCAN_PING) as executor_de_tarefas:
-        # Para cada IP na lista, submetemos a função 'testar_host_com_ping' para ser executada
-        # por um dos trabalhadores do executor.
-        # 'mapa_futuro_para_ip' guarda a relação entre a tarefa futura e o IP correspondente,
-        # para sabermos a qual IP um resultado pertence.
+    # 'with' garante que o ThreadPoolExecutor seja fechado corretamente no final.
+    # 'max_workers' é o número de "pingadores" simultâneos.
+    with ThreadPoolExecutor(max_workers=MAX_THREADS_SCAN_PING) as executor:
+        # Cria um "mapa" onde cada "tarefa futura de ping" está ligada ao IP que ela vai testar.
+        # 'executor.submit(função, argumento)' agenda a função para ser executada.
         mapa_futuro_para_ip = {
-            executor_de_tarefas.submit(testar_host_com_ping, ip_atual): ip_atual
+            executor.submit(testar_host_com_ping, ip_atual): ip_atual
             for ip_atual in lista_ips_para_testar
         }
-
-        # 'as_completed' espera que as tarefas (pings) terminem, na ordem em que completarem.
+        # 'as_completed' nos entrega cada tarefa assim que ela termina.
         for futuro_da_tarefa_ping in as_completed(mapa_futuro_para_ip):
-            ip_associado_ao_futuro = mapa_futuro_para_ip[futuro_da_tarefa_ping]
+            ip_associado_ao_futuro = mapa_futuro_para_ip[futuro_da_tarefa_ping] # Descobre qual IP era.
             try:
-                # '.result()' pega o valor retornado pela função 'testar_host_com_ping' (True ou False).
+                # '.result()' pega o resultado da função testar_host_com_ping (True ou False).
                 if futuro_da_tarefa_ping.result():
-                    ips_ativos_via_ping.append(str(ip_associado_ao_futuro))
-            except Exception:
-                # Se houve algum erro ao obter o resultado da tarefa.
-                # print(f"  [Ping Scan DEBUG] Erro ao processar resultado do ping para {ip_associado_ao_futuro}: {e_thread_ping}")
-                pass # Ignora o erro e continua com os próximos.
-
-    # if ips_ativos_via_ping:
-        # print(f"  [Ping Scan DEBUG] {len(ips_ativos_via_ping)} IPs ativos encontrados via ping.")
-    # else:
-        # print(f"  [Ping Scan DEBUG] Nenhum IP ativo encontrado via ping.")
-
-    return list(set(ips_ativos_via_ping))
+                    ips_ativos_via_ping.append(str(ip_associado_ao_futuro)) # Adiciona IP à lista se True.
+            except Exception: # Se der erro ao pegar o resultado da tarefa.
+                pass # Ignora e continua.
+    return list(set(ips_ativos_via_ping)) # Retorna lista sem duplicatas.
 
 def executar_scan_completo_na_rede(objeto_rede_alvo):
     """
@@ -276,215 +239,140 @@ def executar_scan_completo_na_rede(objeto_rede_alvo):
     Retorna:
         list: Uma lista de IPs (strings) ativos encontrados na rede.
     """
-    # 'set' é usado para armazenar os IPs ativos, pois ele automaticamente evita duplicatas.
-    conjunto_ips_ativos = set()
+    ativos = set() # Usamos um 'set' para automaticamente evitar IPs duplicados.
 
-    if USAR_ARP_SCAN:
-        print(f"[SCAN INFO] Iniciando Fase 1: Scan ARP para {objeto_rede_alvo}...")
-        ips_do_arp = scan_arp_rede_local(objeto_rede_alvo)
-        for ip_encontrado_arp in ips_do_arp:
-            conjunto_ips_ativos.add(ip_encontrado_arp)
-        print(f"[SCAN INFO] Fase 1 (ARP) concluída. {len(ips_do_arp)} hosts encontrados via ARP.")
+    if USAR_ARP_SCAN: # Se a configuração global diz para usar ARP...
+        print(f"[SCAN INFO] Fase 1: Scan ARP para {objeto_rede_alvo}...")
+        ips_arp = scan_arp_rede_local(objeto_rede_alvo) # Faz o scan ARP.
+        for ip_arp_add in ips_arp: # Para cada IP encontrado pelo ARP...
+            ativos.add(ip_arp_add) # Adiciona ao nosso conjunto de IPs ativos.
+        print(f"[SCAN INFO] Fase 1 (ARP) concluída. {len(ips_arp)} hosts encontrados via ARP (adicionados ao conjunto: {len(ativos)}).")
 
-    print(f"[SCAN INFO] Iniciando Fase 2: Scan Ping para {objeto_rede_alvo}...")
-    ips_do_ping = scan_ping_em_paralelo(objeto_rede_alvo)
-    for ip_encontrado_ping in ips_do_ping:
-        conjunto_ips_ativos.add(ip_encontrado_ping)
-    print(f"[SCAN INFO] Fase 2 (Ping) concluída. {len(ips_do_ping)} hosts encontrados ou confirmados via Ping.")
+    print(f"[SCAN INFO] Fase 2: Scan Ping para {objeto_rede_alvo}...")
+    ips_ping = scan_ping_em_paralelo(objeto_rede_alvo) # Faz o scan Ping.
+    for ip_ping_add in ips_ping: # Para cada IP encontrado pelo Ping...
+        ativos.add(ip_ping_add) # Adiciona ao conjunto (se já não estiver lá do ARP).
+    print(f"[SCAN INFO] Fase 2 (Ping) concluída. {len(ips_ping)} hosts encontrados ou confirmados via Ping (total no conjunto: {len(ativos)}).")
 
-    total_encontrado = len(conjunto_ips_ativos)
-    if total_encontrado > 0:
-        print(f"[SCAN INFO] Scan total finalizado! {total_encontrado} hosts ativos únicos encontrados na rede {objeto_rede_alvo}. :)")
+    total = len(ativos) # Quantos IPs únicos foram encontrados no total.
+    if total > 0:
+        print(f"[SCAN INFO] Scan total finalizado! {total} hosts ativos únicos. :)")
     else:
-        print(f"[SCAN INFO] Scan total finalizado. Nenhum host ativo encontrado na rede {objeto_rede_alvo}. :(")
-    
-    return list(conjunto_ips_ativos) # Converte o conjunto de volta para uma lista.
+        print(f"[SCAN INFO] Scan total finalizado. Nenhum host ativo. :(")
+    return list(ativos) # Retorna como uma lista.
 
 # --------------------------------------------------------------------------------
 # SEÇÃO 4: FUNÇÃO PARA GERENCIAR CADA CLIENTE CONECTADO
 # --------------------------------------------------------------------------------
-
-def gerenciar_conexao_cliente(socket_conexao_cliente, endereco_ip_cliente):
+def gerenciar_conexao_cliente(sock_cli, end_cli): # sock_cli: telefone do cliente, end_cli: endereço do cliente
     """
     Esta função é executada para cada cliente que se conecta ao servidor.
     Ela recebe a requisição do cliente (CIDR), processa e envia a resposta.
-
-    Argumentos:
-        socket_conexao_cliente (socket.socket): O objeto socket para esta conexão específica com o cliente.
-        endereco_ip_cliente (tuple): Uma tupla contendo o IP e a porta do cliente conectado (ex: ('192.168.1.10', 54321)).
     """
-    print(f"[CONEXÃO] Cliente {endereco_ip_cliente} conectou-se!")
+    print(f"[CONEXÃO] Cliente {end_cli} conectou-se!") # Avisa no console do servidor.
+    try: # Bloco principal para tratar toda a comunicação com este cliente.
+        while True: # Loop para permitir que o cliente faça vários pedidos.
+            # Espera receber dados (o CIDR) do cliente.
+            # recv(1024) lê até 1024 bytes. decode transforma bytes em texto. strip tira espaços.
+            dados = sock_cli.recv(1024).decode('utf-8').strip()
 
-    # O bloco 'try...finally' garante que certas ações (como fechar o socket)
-    # aconteçam mesmo que ocorram erros.
-    try:
-        # Loop para continuar recebendo dados do mesmo cliente até que ele desconecte
-        # ou envie uma mensagem vazia.
-        while True:
-            # 1. Recebe dados do cliente.
-            #    '.recv(1024)' tenta ler até 1024 bytes de dados.
-            #    '.decode('utf-8')' converte os bytes recebidos (que é como os dados viajam na rede) para texto (string).
-            #    '.strip()' remove espaços em branco extras do início e do fim do texto.
-            dados_recebidos_do_cliente = socket_conexao_cliente.recv(1024).decode('utf-8').strip()
+            if not dados: # Se o cliente não enviou nada (ex: fechou a conexão)...
+                print(f"[CONEXÃO] Cliente {end_cli} desconectou ou enviou dados vazios."); break # Sai do loop.
 
-            # 2. Verifica se o cliente enviou algo.
-            #    Se 'dados_recebidos_do_cliente' for uma string vazia, significa que o cliente
-            #    provavelmente fechou a conexão.
-            if not dados_recebidos_do_cliente:
-                print(f"[CONEXÃO] Cliente {endereco_ip_cliente} enviou dados vazios ou desconectou.")
-                break # Sai do loop 'while True', encerrando o tratamento para este cliente.
+            print(f"[CLIENTE {end_cli}] Requisição: '{dados}'") # Mostra o que o cliente pediu.
 
-            print(f"[CLIENTE {endereco_ip_cliente}] Requisição recebida: '{dados_recebidos_do_cliente}'")
+            # Valida o formato do CIDR (ex: 192.168.1.0/24) usando Expressão Regular.
+            # re.match verifica se o INÍCIO do texto 'dados' bate com o padrão.
+            if not re.match(r'^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$', dados):
+                # Se não bateu com o padrão...
+                sock_cli.sendall("ERRO: Formato CIDR inválido. Use IP/prefixo (ex: 192.168.1.0/24).\n")
+                continue # Pula o resto e volta para o início do while, esperando nova entrada.
 
-            # 3. Valida o formato da string CIDR recebida (ex: "192.168.1.0/24").
-            #    're.compile()' cria um "objeto de expressão regular" para o padrão.
-            #    '^' significa início da string, '$' significa fim da string.
-            #    '(\d{1,3}\.){3}\d{1,3}' casa com um formato de IP (ex: xxx.xxx.xxx.xxx).
-            #    '\/\d{1,2}' casa com uma barra seguida de 1 ou 2 dígitos (o prefixo da máscara).
-            padrao_cidr_esperado = re.compile(r'^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$')
-            if not padrao_cidr_esperado.match(dados_recebidos_do_cliente):
-                mensagem_erro_formato = "ERRO: Formato da rede CIDR inválido. Por favor, use o formato como '192.168.1.0/24'.\n"
-                # '.encode('utf-8')' converte a mensagem de texto para bytes antes de enviar.
-                socket_conexao_cliente.sendall(mensagem_erro_formato.encode('utf-8'))
-                continue # Volta para o início do loop 'while True' para esperar uma nova tentativa do cliente.
+            try: # Tenta processar o CIDR e fazer o scan.
+                # Converte a string CIDR para um objeto de rede Python.
+                # strict=False permite CIDRs que apontam para o endereço da rede (ex: x.x.x.0/24).
+                rede = ipaddress.IPv4Network(dados, strict=False)
 
-            # 4. Tenta converter a string CIDR em um objeto de rede Python.
-            try:
-                # 'ipaddress.IPv4Network()' faz essa conversão e validação.
-                # 'strict=False' permite que o endereço base da rede (ex: 192.168.1.0) seja usado,
-                # o que é comum na notação CIDR.
-                objeto_rede_para_scan = ipaddress.IPv4Network(dados_recebidos_do_cliente, strict=False)
+                # Avisa o cliente que o scan começou.
+                sock_cli.sendall(f"INFO: Scan iniciado para {rede}. Aguarde...\n".encode('utf-8'))
 
-                mensagem_inicio_scan = f"INFO: Scan iniciado para a rede {objeto_rede_para_scan}. Aguarde os resultados...\n"
-                socket_conexao_cliente.sendall(mensagem_inicio_scan.encode('utf-8'))
+                # Chama a função principal de scan.
+                ips_ativos = executar_scan_completo_na_rede(rede)
 
-                # 5. Executa o scan na rede!
-                lista_ips_ativos_encontrados = executar_scan_completo_na_rede(objeto_rede_para_scan)
-
-                # 6. Envia os resultados de volta para o cliente.
-                if lista_ips_ativos_encontrados:
-                    mensagem_quantidade = f"RESULTADO: {len(lista_ips_ativos_encontrados)} host(s) ativo(s) encontrado(s):\n"
-                    socket_conexao_cliente.sendall(mensagem_quantidade.encode('utf-8'))
-
-                    # Para cada IP ativo encontrado...
-                    for ip_ativo_str in lista_ips_ativos_encontrados:
-                        # Tenta obter o sysName via SNMP para este IP.
-                        sysname_do_host = obter_sysname_via_snmp(ip_ativo_str)
-
-                        if sysname_do_host:
-                            # Se o sysName foi obtido, envia "IP sysName".
-                            linha_resposta_cliente = f"{ip_ativo_str} {sysname_do_host}\n"
-                        else:
-                            # Se não conseguiu o sysName (ou SNMP não está habilitado/configurado no alvo),
-                            # envia apenas o IP, conforme o requisito do trabalho.
-                            linha_resposta_cliente = f"{ip_ativo_str}\n"
-                        socket_conexao_cliente.sendall(linha_resposta_cliente.encode('utf-8'))
-                else:
-                    # Se nenhum host ativo foi encontrado.
-                    socket_conexao_cliente.sendall(b"RESULTADO: Nenhum host ativo encontrado na rede especificada.\n")
-                
-                # Mensagem final para esta requisição de scan específica.
-                socket_conexao_cliente.sendall("INFO: Scan para esta rede concluído.\n")
-
-            except ValueError as e_valor_ip:
-                # Se 'ipaddress.IPv4Network()' não conseguir processar a string (ex: IP inválido como 999.999.9.9/24).
-                mensagem_erro_ip_invalido = f"ERRO: O endereço de rede '{dados_recebidos_do_cliente}' parece ser inválido. Detalhe: {e_valor_ip}\n"
-                socket_conexao_cliente.sendall(mensagem_erro_ip_invalido.encode('utf-8'))
-
-    except ConnectionResetError:
-        # Ocorre se o cliente fechar a conexão abruptamente.
-        print(f"[CONEXÃO] Cliente {endereco_ip_cliente} fechou a conexão inesperadamente.")
-    except Exception as e_geral_cliente:
-        # Captura qualquer outro erro inesperado durante a comunicação com este cliente.
-        print(f"[ERRO] Erro inesperado com o cliente {endereco_ip_cliente}: {e_geral_cliente}")
-    finally:
-        # Este bloco 'finally' é executado SEMPRE, não importa se houve erro ou não.
-        # É importante para garantir que a conexão com o cliente seja fechada corretamente.
-        print(f"[CONEXÃO] Encerrando conexão com o cliente {endereco_ip_cliente}.")
-        socket_conexao_cliente.close()
+                if ips_ativos: # Se encontrou algum IP ativo...
+                    # Envia a quantidade para o cliente.
+                    sock_cli.sendall(f"RESULTADO: {len(ips_ativos)} host(s) ativo(s):\n".encode('utf-8'))
+                    # Para cada IP ativo na lista...
+                    for ip in ips_ativos:
+                        sysname = obter_sysname_via_snmp(ip) # Tenta pegar o nome do sistema via SNMP.
+                        # Monta a linha de resposta: "IP NomeDoSistema" ou só "IP".
+                        linha = f"{ip} {sysname}\n" if sysname else f"{ip}\n"
+                        sock_cli.sendall(linha.encode('utf-8')) # Envia a linha.
+                else: # Se não encontrou nenhum IP ativo...
+                    sock_cli.sendall(b"RESULTADO: Nenhum host ativo encontrado.\n")
+                # Avisa que o scan para ESTA rede terminou.
+                sock_cli.sendall("INFO: Scan para esta rede concluído.\n")
+            except ValueError as e: # Se o ipaddress.IPv4Network deu erro (CIDR com valor inválido).
+                sock_cli.sendall(f"ERRO: Endereço de rede inválido '{dados}'. {e}\n".encode('utf-8'))
+    except ConnectionResetError: # Se o cliente fechar a conexão de forma abrupta.
+        print(f"[CONEXÃO] Cliente {end_cli} resetou a conexão.")
+    except Exception as e: # Para qualquer outro erro durante a conversa com este cliente.
+        print(f"[ERRO] Cliente {end_cli}: {e}")
+    finally: # Aconteça o que acontecer (erro ou não)...
+        print(f"[CONEXÃO] Encerrando com {end_cli}.")
+        sock_cli.close() # Fecha o "telefone particular" com este cliente.
 
 # --------------------------------------------------------------------------------
 # SEÇÃO 5: FUNÇÃO PRINCIPAL PARA INICIAR O SERVIDOR
 # --------------------------------------------------------------------------------
-
 def iniciar_servidor_principal():
-    """
-    Configura e inicia o servidor TCP principal que vai escutar por conexões de clientes.
-    """
-    # 1. Cria o objeto socket principal do servidor.
-    #    'socket.AF_INET' especifica que usaremos endereçamento IPv4.
-    #    'socket.SOCK_STREAM' especifica que usaremos o protocolo TCP (orientado à conexão).
-    socket_escuta_servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-    # 2. Configura uma opção do socket: SO_REUSEADDR.
-    #    Isso permite que o servidor reinicie e use a mesma porta rapidamente após ser fechado,
-    #    evitando o erro "Address already in use" (Endereço já em uso).
-    socket_escuta_servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-    # 3. Associa (ou "liga" - bind) o socket a um endereço IP e porta específicos.
-    #    '0.0.0.0' significa que o servidor vai escutar em todas as interfaces de rede
-    #    disponíveis no computador (ex: Wi-Fi, Ethernet).
-    #    'PORTA_SERVIDOR' é a porta que definimos lá no início.
+    """Configura e inicia o servidor TCP principal."""
+    # Cria o "telefone principal" do servidor (socket de escuta).
+    sock_serv = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # IPv4, TCP
+    # Permite que o servidor use a mesma porta rapidamente após ser reiniciado.
+    sock_serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
-        socket_escuta_servidor.bind(('0.0.0.0', PORTA_SERVIDOR))
-        print(f"[SERVIDOR] Ligado com sucesso ao endereço 0.0.0.0 na porta {PORTA_SERVIDOR}.")
-    except OSError as e_bind:
-        print(f"[SERVIDOR ERRO] Falha ao tentar ligar o servidor à porta {PORTA_SERVIDOR}. Detalhe: {e_bind}")
-        print("[SERVIDOR ERRO] Verifique se a porta já está sendo usada por outro programa ou se você tem permissão.")
-        return # Sai da função, pois o servidor não pode continuar.
+        # "Conecta o telefone na tomada": liga o socket a um endereço (todas as interfaces) e porta.
+        sock_serv.bind(('0.0.0.0', PORTA_SERVIDOR))
+        print(f"[SERVIDOR] Online na porta {PORTA_SERVIDOR}.")
+    except OSError as e: # Se não conseguir usar a porta (ex: já em uso).
+        print(f"[SERVIDOR ERRO] Bind falhou na porta {PORTA_SERVIDOR}: {e}")
+        return # Não pode continuar.
 
-    # 4. Coloca o socket em modo de escuta, pronto para aceitar conexões.
-    #    O número '5' (chamado de backlog) é o número máximo de conexões que podem
-    #    ficar na fila esperando para serem aceitas pelo servidor.
-    socket_escuta_servidor.listen(5)
-    print(f"[SERVIDOR] Escutando por conexões de clientes na porta {PORTA_SERVIDOR}...")
-
-    # 5. Loop principal do servidor: fica continuamente aceitando novas conexões de clientes.
+    sock_serv.listen(5) # Coloca o servidor para "escutar" por até 5 conexões na fila.
+    print(f"[SERVIDOR] Aguardando conexões...")
     try:
-        while True: # Loop infinito, até que o servidor seja interrompido (ex: Ctrl+C).
-            # '.accept()' bloqueia a execução e espera até que um cliente tente se conectar.
-            # Quando um cliente conecta, '.accept()' retorna duas coisas:
-            #  - 'socket_para_este_cliente': um NOVO objeto socket, específico para a comunicação com ESTE cliente.
-            #  - 'endereco_deste_cliente': uma tupla com o IP e a porta do cliente.
-            socket_para_este_cliente, endereco_deste_cliente = socket_escuta_servidor.accept()
-
-            # Para cada cliente que se conecta, criamos uma nova "thread".
-            # Uma thread é como um sub-programa que roda em paralelo com o resto.
-            # Isso permite que o servidor converse com vários clientes ao mesmo tempo,
-            # sem que um cliente tenha que esperar o outro terminar.
-            # 'target=gerenciar_conexao_cliente' diz qual função a thread vai executar.
-            # 'args=(...)' passa os argumentos para essa função.
-            thread_para_cliente_novo = threading.Thread(
-                target=gerenciar_conexao_cliente,
-                args=(socket_para_este_cliente, endereco_deste_cliente)
-            )
-            # 'daemon=True' significa que se o programa principal do servidor fechar,
-            # todas essas threads de clientes também fecharão automaticamente.
-            thread_para_cliente_novo.daemon = True
-            thread_para_cliente_novo.start() # Inicia a execução da thread.
-
-    except KeyboardInterrupt:
-        # Se o usuário pressionar Ctrl+C no terminal, o programa é interrompido.
-        print("\n[SERVIDOR] Solicitação de desligamento recebida (Ctrl+C). Encerrando...")
-    except Exception as e_loop_servidor:
-        print(f"[SERVIDOR ERRO] Um erro inesperado ocorreu no loop principal do servidor: {e_loop_servidor}")
-    finally:
-        # Garante que o socket de escuta principal do servidor seja fechado ao sair.
-        print("[SERVIDOR] Fechando o socket de escuta principal.")
-        socket_escuta_servidor.close()
+        while True: # Loop infinito para sempre aceitar novos clientes.
+            # ".accept()" espera uma ligação. Quando chega, retorna um NOVO socket
+            # para ESTE cliente ('cli_sock') e o endereço do cliente ('cli_end').
+            cli_sock, cli_end = sock_serv.accept()
+            # Cria um "assistente" (thread) para cuidar deste novo cliente.
+            # 'target' é a função que o assistente vai rodar.
+            # 'args' são os ingredientes para essa função.
+            # 'daemon=True' faz o assistente fechar se o servidor principal fechar.
+            assistente = threading.Thread(target=gerenciar_conexao_cliente, args=(cli_sock, cli_end), daemon=True)
+            assistente.start() # O assistente começa a trabalhar.
+    except KeyboardInterrupt: # Se você apertar Ctrl+C para parar o servidor.
+        print("\n[SERVIDOR] Desligando...")
+    except Exception as e: # Qualquer outro erro grave no servidor.
+        print(f"[SERVIDOR ERRO FATAL] {e}")
+    finally: # Não importa como saiu do loop...
+        sock_serv.close() # Fecha o "telefone principal" do servidor.
 
 # --------------------------------------------------------------------------------
 # SEÇÃO 6: PONTO DE ENTRADA DO SCRIPT (QUANDO EXECUTADO DIRETAMENTE)
 # --------------------------------------------------------------------------------
-# A linha 'if __name__ == "__main__":' é um padrão em Python.
-# O código dentro deste 'if' só será executado se este arquivo
-# ('servidor_scan_detalhado.py') for rodado diretamente (ex: 'python servidor_scan_detalhado.py').
-# Se ele for importado como um módulo por outro script, esta parte não roda.
+# Esta parte só roda se você executar este arquivo diretamente (ex: python nome_do_arquivo.py)
 if __name__ == "__main__":
-    # Pequeno aviso sobre o Scapy, já que ele pode precisar de permissões especiais no Linux.
+    # Aviso sobre o Scapy e permissões se não estiver no Linux.
     if platform.system() != "Linux" and USAR_ARP_SCAN:
-        print("[AVISO INICIAL] O Scan ARP com Scapy é mais eficaz no Linux e pode requerer privilégios de administrador (root/sudo).")
-        print("[AVISO INICIAL] Se encontrar problemas com o ARP Scan em outros sistemas, tente executar como administrador ou defina USAR_ARP_SCAN = False no código.")
+        print("[AVISO] Scan ARP com Scapy pode precisar de root/admin fora do Linux.")
 
-    # Chama a função para iniciar nosso servidor!
-    iniciar_servidor_principal()
+    # Verifica se o cmdgen (ferramenta SNMP) foi importado com sucesso.
+    if CMDGEN_DISPONIVEL:
+        print("[INFO PySNMP] Iniciando servidor com funcionalidade SNMP (via cmdgen).")
+    else:
+        # Se CMDGEN_DISPONIVEL for False, significa que a importação do cmdgen falhou lá no começo.
+        print("[AVISO PySNMP] Iniciando servidor SEM funcionalidade SNMP devido a erro na importação do PySNMP (cmdgen).")
+    
+    iniciar_servidor_principal() # Chama a função para ligar o servidor!
