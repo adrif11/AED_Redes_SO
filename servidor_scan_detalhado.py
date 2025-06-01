@@ -147,7 +147,7 @@ def testar_host_com_ping(ip_host_para_testar):
     else: # Assume Linux ou similar
         comando = ['ping', '-c', '1', '-W', str(TIMEOUT_PING_SEGUNDOS), '-i', '0.2', ip_texto]
 
-    print(f"  [Ping DEBUG] Executando: {' '.join(comando)}") # DESCOMENTADO
+    #print(f"  [Ping DEBUG] Executando: {' '.join(comando)}")
 
     try:
         startupinfo = None
