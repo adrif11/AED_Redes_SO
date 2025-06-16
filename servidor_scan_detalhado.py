@@ -1,4 +1,3 @@
-# Nome do arquivo: servidor_final.py
 # --------------------------------------------------------------------------------
 # SEÇÃO 1: IMPORTAÇÕES
 # --------------------------------------------------------------------------------
@@ -11,14 +10,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import platform
 from scapy.all import ARP, Ether, srp
 
-# TENTATIVA DE IMPORTAR PURESNMP
 try:
     from puresnmp import get as puresnmp_get
     from puresnmp.exc import SnmpError, Timeout as PureSnmpTimeout
     PURESNMP_DISPONIVEL = True
 except ImportError:
     print("[ERRO FATAL PureSNMP] Biblioteca 'puresnmp' não encontrada!")
-    print("Execute no terminal: pip install puresnmp")
+    print("Execute no terminal (com o ambiente virtual ativo): pip install puresnmp")
     print("A funcionalidade SNMP não estará disponível.")
     PURESNMP_DISPONIVEL = False
 
@@ -30,7 +28,6 @@ MAX_THREADS_SCAN_PING = 50
 TIMEOUT_PING_SEGUNDOS = 2.0
 USAR_ARP_SCAN = True
 
-# Configurações para o PureSNMP
 SNMP_COMMUNITY = 'public'
 SNMP_PORTA = 161
 SNMP_TIMEOUT_S = 1.0
@@ -63,19 +60,12 @@ def testar_host_com_ping(ip_host_para_testar):
     ip_texto = str(ip_host_para_testar)
     if platform.system() == "Windows":
         comando = ['ping', '-n', '1', '-w', str(int(TIMEOUT_PING_SEGUNDOS * 1000)), ip_texto]
-    else: # Assume Linux
+    else: # Linux
         comando = ['ping', '-c', '1', '-w', str(int(TIMEOUT_PING_SEGUNDOS)), ip_texto]
-
     try:
-        startupinfo = None
-        if platform.system() == "Windows":
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = subprocess.SW_HIDE
-
         resultado = subprocess.run(
             comando, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=TIMEOUT_PING_SEGUNDOS + 1.0, startupinfo=startupinfo)
+            timeout=TIMEOUT_PING_SEGUNDOS + 1.0)
         return resultado.returncode == 0
     except Exception:
         return False
@@ -88,7 +78,7 @@ def scan_arp_rede_local(objeto_rede_alvo):
         if lista_pacotes_respondidos:
             for _,p_resp in lista_pacotes_respondidos: ips_ativos_via_arp.append(p_resp.psrc)
     except Exception as e:
-        print(f"  [ARP ERRO INTERNO] Falha durante o scan ARP: {e}.")
+        print(f"  [ARP ERRO INTERNO] Falha durante o scan ARP (requer sudo): {e}.")
     return list(set(ips_ativos_via_arp))
 
 def scan_ping_em_paralelo(objeto_rede_alvo):
@@ -126,11 +116,8 @@ def gerenciar_conexao_cliente(sock_cli, end_cli):
     print(f"[CONEXÃO] Cliente {end_cli} conectou-se!")
     try:
         while True:
-            dados_brutos = sock_cli.recv(1024)
-            if not dados_brutos: print(f"[CONEXÃO] Cliente {end_cli} desconectou."); break
-            try: dados = dados_brutos.decode('utf-8').strip()
-            except UnicodeDecodeError: continue
-
+            dados = sock_cli.recv(1024).decode('utf-8').strip()
+            if not dados: print(f"[CONEXÃO] Cliente {end_cli} desconectou."); break
             print(f"[CLIENTE {end_cli}] Requisição: '{dados}'")
 
             if dados.startswith("GET /"):
@@ -176,8 +163,8 @@ def iniciar_servidor_principal():
     finally: sock_serv.close()
 
 if __name__ == "__main__":
-    if platform.system() != "Linux" and USAR_ARP_SCAN:
-        print("[AVISO] Scan ARP com Scapy no Windows requer Npcap e privilégios de administrador.")
+    if platform.system() != "Linux":
+        print("[AVISO] Este script é otimizado para Linux (onde o Scapy com ARP funciona melhor com sudo).")
     
     if PURESNMP_DISPONIVEL:
         print("[INFO] Iniciando servidor com funcionalidade SNMP (via PureSNMP).")
