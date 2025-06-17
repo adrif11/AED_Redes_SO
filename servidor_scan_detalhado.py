@@ -25,6 +25,7 @@ MAX_THREADS_SCAN = 100
 TIMEOUT_PING_SEGUNDOS = 1.0
 USAR_ARP_SCAN = True
 
+# Configurações para o PureSNMP
 SNMP_COMMUNITY = 'public'
 SNMP_PORTA = 161
 SNMP_TIMEOUT_S = 1.0
@@ -59,7 +60,8 @@ def testar_host_com_ping(ip_host_para_testar):
         comando = ['ping', '-c', '1', '-w', str(int(TIMEOUT_PING_SEGUNDOS)), ip_texto]
     try:
         resultado = subprocess.run(
-            comando, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=TIMEOUT_PING_SEGUNDOS + 1.0)
+            comando, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=TIMEOUT_PING_SEGUNDOS + 1.0)
         return resultado.returncode == 0
     except Exception:
         return False
@@ -118,55 +120,65 @@ def executar_scan_completo_na_rede(objeto_rede_alvo):
 
 def gerenciar_conexao_cliente(sock_cli, end_cli):
     """
-    Gerencia a conexão com um cliente. Esta versão é adaptada para ler
-    uma linha completa de cada vez, tornando-a compatível com clientes
-    de terminal como Telnet e netcat.
+    Gerencia a conexão com um cliente de forma persistente, lendo múltiplas
+    requisições até que o cliente desconecte ou envie 'sair'.
     """
     print(f"[CONEXÃO] Cliente {end_cli} conectou-se.")
     
     try:
+        # Transforma o socket em um objeto tipo "arquivo" para ler e escrever linhas.
         arquivo_cliente = sock_cli.makefile('rw', encoding='utf-8', newline='\n')
-        linha_recebida = arquivo_cliente.readline().strip()
+        arquivo_cliente.write("--- Bem-vindo ao Servidor de Scan de Rede ---\n")
+        arquivo_cliente.write("Digite um CIDR (ex: 192.168.1.0/24) ou 'sair' para fechar.\n")
+        arquivo_cliente.flush()
 
-        if not linha_recebida:
-            print(f"[CONEXÃO] Cliente {end_cli} desconectou sem enviar dados.")
-            return
-
-        print(f"[CLIENTE {end_cli}] Requisição: '{linha_recebida}'")
-
-
-        if linha_recebida.startswith("GET /"):
-            arquivo_cliente.write("HTTP/1.1 200 OK\n\nServidor de Scan. Use um cliente Telnet ou netcat.\n")
-            arquivo_cliente.flush() # Garante que a mensagem seja enviada
-            return
-
-        # 2. VALIDAR E PROCESSAR A REQUISIÇÃO
-        if not re.match(r'^(\d{1,3}\.){3}\d{1,3}\/\d{1,32}$', linha_recebida):
-            arquivo_cliente.write("ERRO: Formato CIDR invalido. Use IP/prefixo (ex: 192.168.1.0/24).\n")
-            arquivo_cliente.flush()
-            return
-        
-        try:
-            rede = ipaddress.IPv4Network(linha_recebida, strict=False)
-            arquivo_cliente.write(f"INFO: Scan iniciado para {rede}. Aguarde...\n")
-            arquivo_cliente.flush()
+        # **** MUDANÇA PRINCIPAL AQUI: LOOP WHILE TRUE ****
+        # Este loop mantém a conexão aberta, esperando por novos comandos.
+        while True:
+            # .readline() espera até que o cliente envie uma linha terminada com Enter.
+            linha_recebida = arquivo_cliente.readline()
+            if not linha_recebida:
+                # Se readline() retorna uma string vazia, o cliente fechou a conexão.
+                print(f"[CONEXÃO] Cliente {end_cli} desconectou.")
+                break # Sai do loop while
             
-            resultados_scan = executar_scan_completo_na_rede(rede)
+            # Remove espaços em branco e caracteres de nova linha da entrada
+            comando_cliente = linha_recebida.strip()
+            print(f"[CLIENTE {end_cli}] Requisição: '{comando_cliente}'")
+
+            # Verifica se o cliente quer sair
+            if comando_cliente.lower() in ['sair', 'exit', 'quit']:
+                arquivo_cliente.write("Até logo!\n")
+                arquivo_cliente.flush()
+                break # Sai do loop while
+
+            # Valida o formato CIDR
+            if not re.match(r'^(\d{1,3}\.){3}\d{1,3}\/\d{1,32}$', comando_cliente):
+                arquivo_cliente.write("ERRO: Formato CIDR invalido. Tente novamente.\n")
+                arquivo_cliente.flush()
+                continue # Volta para o início do loop, esperando o próximo comando
             
-            if resultados_scan:
-                arquivo_cliente.write(f"\n--- Relatorio de Scan para {rede} ---\n")
-                for ip, status in resultados_scan:
+            try:
+                rede = ipaddress.IPv4Network(comando_cliente, strict=False)
+                arquivo_cliente.write(f"\nINFO: Scan iniciado para {rede}. Aguarde...\n")
+                arquivo_cliente.flush()
+                
+                resultados_scan = executar_scan_completo_na_rede(rede)
+                
+                if resultados_scan:
+                    arquivo_cliente.write(f"\n--- Relatorio de Scan para {rede} ---\n")
+                    for ip, status in resultados_scan:
+                        linha = f"{ip:<18} | {status}\n"
+                        arquivo_cliente.write(linha)
+                else:
+                    arquivo_cliente.write("INFO: Nenhum host encontrado na faixa especificada.\n")
 
-                    linha = f"{ip:<18} | {status}\n"
-                    arquivo_cliente.write(linha)
-            else:
-                arquivo_cliente.write("INFO: Nenhum host encontrado na faixa especificada.\n")
+                arquivo_cliente.write("\nINFO: Scan concluído. Digite um novo CIDR ou 'sair'.\n")
+                arquivo_cliente.flush()
 
-        except ValueError as e:
-            arquivo_cliente.write(f"ERRO: Endereco de rede invalido '{linha_recebida}'. {e}\n")
-        
-        finally:
-            arquivo_cliente.flush()
+            except ValueError as e:
+                arquivo_cliente.write(f"ERRO: Endereco de rede invalido '{comando_cliente}'. {e}\n")
+                arquivo_cliente.flush()
 
     except Exception as e:
         print(f"[ERRO] Erro inesperado com o cliente {end_cli}: {e}")
@@ -174,25 +186,22 @@ def gerenciar_conexao_cliente(sock_cli, end_cli):
         print(f"[CONEXÃO] Encerrando com {end_cli}.")
         sock_cli.close()
 
-
 def iniciar_servidor_principal():
     sock_serv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock_serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         sock_serv.bind(('0.0.0.0', PORTA_SERVIDOR))
         print(f"[SERVIDOR] Online na porta {PORTA_SERVIDOR}.")
-    except OSError as e:
-        print(f"[SERVIDOR ERRO] Bind falhou: {e}"); return
+    except OSError as e: print(f"[SERVIDOR ERRO] Bind falhou: {e}"); return
     sock_serv.listen(5)
     print(f"[SERVIDOR] Aguardando conexoes...")
     try:
         while True:
             cli_sock, cli_end = sock_serv.accept()
             threading.Thread(target=gerenciar_conexao_cliente, args=(cli_sock, cli_end), daemon=True).start()
-    except KeyboardInterrupt:
-        print("\n[SERVIDOR] Desligando...")
-    finally:
-        sock_serv.close()
+    except KeyboardInterrupt: print("\n[SERVIDOR] Desligando...")
+    except Exception as e: print(f"[SERVIDOR ERRO FATAL] {e}")
+    finally: sock_serv.close()
 
 if __name__ == "__main__":
     print("--- Servidor de Scan de Ativos em Rede ---")
@@ -200,4 +209,5 @@ if __name__ == "__main__":
         print("[INFO] Funcionalidade SNMP ativa (via PureSNMP).")
     else:
         print("[AVISO] Biblioteca 'puresnmp' não encontrada. Funcionalidade SNMP desativada.")
+    
     iniciar_servidor_principal()
